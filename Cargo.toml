@@ -1,0 +1,34 @@
+[package]
+name = "mumbling"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A high-performance implementation of the Apache Iceberg Mumbling bitmap format"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["bitmap", "iceberg", "compression", "database"]
+categories = ["data-structures", "compression", "encoding"]
+
+[dependencies]
+
+[dev-dependencies]
+criterion = "0.5.1"
+dhat = "0.3.3"
+roaring = "0.11.3"
+
+[[bench]]
+name = "core"
+harness = false
+
+[[bench]]
+name = "perf"
+harness = false
+
+[[bench]]
+name = "allocations"
+harness = false
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+

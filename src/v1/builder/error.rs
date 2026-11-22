@@ -71,4 +71,11 @@ impl fmt::Display for FromSortedError {
     }
 }
 
-impl core::error::Error for FromSortedError {}
+impl core::error::Error for FromSortedError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::PositionOutOfRange(error) => Some(error),
+            Self::NotStrictlyIncreasing { .. } => None,
+        }
+    }
+}

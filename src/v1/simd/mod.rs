@@ -1,10 +1,15 @@
 //! Internal lookup and validation kernels for version-1 containers.
 //!
-//! AArch64 uses NEON and x86-64 uses baseline SSE2; other architectures use
-//! scalar code. No runtime feature detection or aligned input is required.
+//! AArch64 uses NEON. x86-64 bulk validation selects AVX-512BW, AVX2, or SSE2
+//! once per payload, checking CPU support and OS vector-register state.
+//! Tiny lookups retain SSE2 to avoid dispatch on every query. Other targets
+//! use scalar code. Unaligned input is supported on every path.
 //! The reader validates payload framing before calling these helpers.
 
 use crate::Error;
+
+#[cfg(target_arch = "x86_64")]
+mod x86;
 
 #[inline]
 /// Searches a validated sparse container for a local position.
@@ -83,6 +88,12 @@ pub(super) fn validate_uniform_dense(payload: &[u8]) -> Result<u32, Error> {
 }
 
 #[cfg(target_arch = "x86_64")]
+/// Dispatches once per payload after checking CPU and OS vector support.
+pub(super) fn validate_uniform_dense(payload: &[u8]) -> Result<u32, Error> {
+    x86::validate_dense(payload)
+}
+
+#[cfg(target_arch = "x86_64")]
 #[inline(never)]
 /// Validates dense-container occupancy and returns the total cardinality.
 ///
@@ -92,7 +103,7 @@ pub(super) fn validate_uniform_dense(payload: &[u8]) -> Result<u32, Error> {
 /// the header's declared total cardinality are checked by the reader.
 /// NEON uses byte population counts; SSE2 uses parallel bit counting and
 /// horizontal sums; the scalar fallback uses `count_ones`.
-pub(super) fn validate_uniform_dense(payload: &[u8]) -> Result<u32, Error> {
+fn validate_uniform_dense_sse2(payload: &[u8]) -> Result<u32, Error> {
     let mut cardinality = 0;
     for container in payload.chunks_exact(32) {
         // SAFETY: each container has exactly 32 bytes, covering both loads.
@@ -166,6 +177,12 @@ pub(super) fn validate_uniform_sparse(payload: &[u8], width: usize) -> bool {
 }
 
 #[cfg(target_arch = "x86_64")]
+/// Dispatches once per payload after checking CPU and OS vector support.
+pub(super) fn validate_uniform_sparse(payload: &[u8], width: usize) -> bool {
+    x86::validate_sparse(payload, width)
+}
+
+#[cfg(target_arch = "x86_64")]
 #[inline(never)]
 /// Checks strict ordering within every fixed-width sparse container.
 ///
@@ -175,7 +192,7 @@ pub(super) fn validate_uniform_sparse(payload: &[u8], width: usize) -> bool {
 /// For widths 17..=31, SIMD compares the first and last 16 adjacent pairs,
 /// covering every pair without comparing across container boundaries.
 /// Smaller widths and scalar targets compare adjacent bytes directly.
-pub(super) fn validate_uniform_sparse(payload: &[u8], width: usize) -> bool {
+fn validate_uniform_sparse_sse2(payload: &[u8], width: usize) -> bool {
     if width <= 1 {
         return true;
     }
@@ -291,6 +308,7 @@ pub(super) fn is_strictly_increasing_large(values: &[u8]) -> bool {
 ///
 /// `bytes` must point to at least 16 initialized, readable bytes within one
 /// allocation. Alignment is not required. SSE2 is baseline on x86-64.
+#[target_feature(enable = "sse2")]
 unsafe fn x86_count_bits_16(bytes: *const u8) -> u32 {
     use core::arch::x86_64::{
         __m128i, _mm_add_epi8, _mm_and_si128, _mm_loadu_si128, _mm_sad_epu8, _mm_set1_epi8,
@@ -327,6 +345,7 @@ unsafe fn x86_count_bits_16(bytes: *const u8) -> u32 {
 ///
 /// `values` must point to at least 17 initialized, readable bytes within one
 /// allocation. Alignment is not required. SSE2 is baseline on x86-64.
+#[target_feature(enable = "sse2")]
 unsafe fn x86_16_pairs_increasing(values: *const u8) -> bool {
     use core::arch::x86_64::{
         __m128i, _mm_cmpgt_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8, _mm_xor_si128,

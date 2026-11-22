@@ -117,7 +117,21 @@ impl<'a> MumblingBitmapV1<'a> {
         }
     }
 
-    /// Returns the number of positions present in the bitmap.
+    /// Returns the number of positions, using Roaring's `u64` count convention.
+    #[inline]
+    pub const fn len(&self) -> u64 {
+        self.cardinality as u64
+    }
+
+    /// Returns whether this bitmap contains no positions.
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.cardinality == 0
+    }
+
+    /// Returns the version-1 cardinality as a `u32`.
+    ///
+    /// Prefer [`Self::len`] when sharing query code with Roaring.
     #[inline]
     pub const fn cardinality(&self) -> u32 {
         self.cardinality

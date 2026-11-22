@@ -3,59 +3,83 @@
 A safe, `no_std + alloc`, efficient Rust implementation of the [Apache Iceberg Mumbling
 bitmap format][spec].
 
+Requires Rust 1.89 or later. AArch64 uses NEON; x86-64 bulk validation detects
+AVX-512BW, AVX2, or SSE2 at runtime, including OS register-state support.
+Other architectures use scalar code. Tiny x86 lookups retain SSE2 to avoid
+per-query dispatch. The timings below measure the AArch64 implementation.
+
 ## Benchmarks vs Roaring
 
-Representative Criterion medians on Apple Silicon, using release builds and
-identical value sets for both implementations:
+Local Apple Silicon measurements, Rust 1.92.0 and Roaring 0.11.3. Times are
+Criterion medians; lower is better. Both formats receive identical values.
 
-| Operation | Workload | Mumbling latency | Mumbling throughput | Roaring latency | Roaring throughput | Result |
-|:--|:--|--:|--:|--:|--:|--:|
-| Parse | Sparse full-universe bitmap: 8,192 values, one set bit every 256 positions | 3.29 µs | 304K bitmaps/s | 4.86 µs | 206K bitmaps/s | **1.48× faster** |
-| Parse | Near-threshold sparse bitmap: 253,952 values, 31 set bits in every 256-position region | 7.61 µs | 131K bitmaps/s | 12.10 µs | 82.6K bitmaps/s | **1.59× faster** |
-| Lookup | 16,384 successful queries against 31,744 values in `0..262_144`; 31 values spaced 8 positions apart per 256-position region | 19.65 µs/batch | 834M queries/s | 25.20 µs/batch | 650M queries/s | **1.28× faster** |
-| Iterate | 1,024 values spread one per 256-position region | 81 ns | 12.6B values/s | 1.82 µs | 563M values/s | **22.5× faster** |
-| Iterate | 262,144 values filling every tested region | 317 µs | 827M values/s | 366 µs | 716M values/s | **1.15× faster** |
-| Construct | 100,000 uniformly distributed positions supplied in random order | 152 µs | 658M values/s | 6.71 ms | 14.9M values/s | **44.1× faster** |
-| Construct | Entire `0..2_097_152` universe as one range | 2.17 ns | O(1) lazy range | 652 ns | — | **300× faster** |
-| Intersection | Two full-universe strided bitmaps, materializing the result | 9.38 µs | 224B positions/s | 11.74 µs | 179B positions/s | **1.25× faster** |
-| Intersection cardinality | Same inputs, counting without materializing | 4.68 µs | 448B positions/s | 4.84 µs | 433B positions/s | **1.04× faster** |
-| Serialize | 100,000 uniformly distributed values, one new output buffer | 146 µs | 685M values/s | 40.6 µs | 2.46B values/s | **3.59× slower** |
-| Serialize prepared | Prepare once and write four output copies | 144 µs | 27.8K writes/s | 161 µs | 24.8K writes/s | **1.11× faster** |
+### End-to-end latency
 
-Throughput is derived from the corresponding median latency. “Positions/s”
-for set operations is the fixed 2,097,152-position universe processed per
-operation; the full-range construction throughput is intentionally omitted
-because Mumbling represents that range lazily in constant time.
-Iteration benchmarks consume the values by summing them; their throughput
-includes any compiler vectorization of that operation. Intersection inputs
-contain every third and every fifth position, respectively.
+Each bitmap contains 100,000 deleted positions: either scattered throughout
+`0..2_097_152` or the contiguous range `0..100_000`. These are in-memory
+pipelines, including construction/parsing, output allocation, and teardown.
+
+| Pipeline | Input | Mumbling | Roaring |
+|:--|:--|--:|--:|
+| Build + serialize | Scattered deletes | 274 µs | 1.05 ms |
+| Build + serialize | Contiguous deletes | 156 µs | 431 µs |
+| Parse + filter 16K rows | Scattered deletes | 105 µs | 251 µs |
+| Parse + filter 16K rows | Contiguous deletes | 14.3 µs | 19.4 µs |
+| Parse + enumerate | Scattered deletes | 171 µs | 282 µs |
+| Parse + enumerate | Contiguous deletes | 125 µs | 309 µs |
+
+Roaring writers use the faster measured strategy: direct insertion or sorting
+and bulk construction, including preprocessing and `optimize()` in the timing.
+Read-only Roaring fixtures are optimized before timing. No disk or network IO
+is included. Filtering materializes surviving positions; enumeration
+materializes all deleted positions.
+
+### Operation latency
+
+| Operation | Workload | Mumbling | Roaring |
+|:--|:--|--:|--:|
+| Parse | 8,192 values, one every 256 positions | 3.19 µs | 4.7 µs |
+| Parse | 253,952 values, 31 per 256-position region | 7.45 µs | 7.85 µs |
+| Lookup batch | 16,384 hits on 31,744 scattered positions | 23.7 µs | 25.1 µs |
+| Build from unsorted input | 100,000 scattered positions; Roaring sort + bulk | 150 µs | 1.02 ms |
+| Build from sorted input | Same 100,000 positions, already sorted | 181 µs | 277 µs |
+| Serialize once | 100,000 scattered positions; fresh output | 124 µs | 40.6 µs |
+| Copy cached encoding | Same bitmap; reused output, encoding excluded for both | 0.93 µs | 2.41 µs |
+
+Lookup positions span `0..262_144`, with 31 values spaced eight positions apart
+per 256-position region. Cached bytes are available to **both** formats; the
+cached-copy row is not a comparison against Roaring re-encoding each time.
+
+### Throughput
+
+Derived from the corresponding scattered-input latency above:
+
+| Pipeline | Mumbling | Roaring |
+|:--|--:|--:|
+| Build + serialize | 364M positions/s | 95M positions/s |
+| Parse + filter | 157M rows/s | 65.3M rows/s |
+| Parse + enumerate | 585M positions/s | 354M positions/s |
 
 ### Memory
 
-The same 100,000 uniformly distributed values were used for wire size and live
-heap measurements:
+For the same 100,000 scattered positions:
 
-| Representation | Mumbling | Roaring | Mumbling relative to Roaring |
-|:--|--:|--:|--:|
-| Serialized bytes | 104,519 B | 200,264 B | **1.92× smaller** |
-| Parsed bitmap, retained heap | 40,964 B | 201,280 B | **4.91× less heap** |
-| Parsed bitmap, including required backing bytes | 145,483 B | 201,280 B | **1.38× smaller** |
-| Mutable builder, retained heap | 262,144 B | 263,424 B | **1,280 B smaller** |
-| Construction allocation traffic | 262,144 B in 1 allocation | 526,432 B in 356 allocations | **2.01× fewer bytes** |
+| Representation | Mumbling | Roaring |
+|:--|--:|--:|
+| Serialized bytes | 104,519 B | 200,264 B |
+| Parsed bitmap, retained heap | 40,964 B | 201,280 B |
+| Parsed bitmap + required backing bytes | 145,483 B | 201,280 B |
 
-Retained-heap figures exclude the small stack-resident Rust structs and
-allocator bookkeeping. The combined reader figure assumes Mumbling's borrowed
-104,519-byte input is resident and not shared; a memory-mapped or shared input
-would not add that entire amount to the reader's incremental heap footprint.
+The combined reader figure counts a right-sized, unshared serialized input for
+Mumbling; Roaring can release its input after parsing. These totals exclude
+stack structs, allocator bookkeeping, and spare capacity in input vectors.
+The memory audit also reports actual output capacity and builder allocation
+traffic for both Roaring construction strategies.
 
-The full-range result uses the builder's lazy contiguous-prefix representation.
-Prepared serialization amortizes one encoding pass across repeated writes;
-one-shot serialization remains a known performance gap.
-
-Run the comparison suite with `cargo bench --bench perf` and the memory audit
-with `cargo bench --bench allocations`. Results are machine-dependent; the
-x86-64 SSE2 paths are implemented but are not represented by the Apple Silicon
-measurements above.
+See [the benchmark guide](benches/README.md) for commands, workload definitions,
+CPU and memory modes, and the serialization investigation. Recorded estimates
+are in [the result summary](benches/results.json). One-shot serialization
+remains slower than Roaring; no encoder optimization is claimed in this pass.
 
 ## Read and validate
 
@@ -70,7 +94,7 @@ use mumbling::v1::MumblingBitmapV1;
 let bitmap = MumblingBitmapV1::parse(serialized)?;
 
 assert_eq!(bitmap.as_bytes(), serialized);
-println!("{} values in {} containers", bitmap.cardinality(), bitmap.container_count());
+println!("{} values in {} containers", bitmap.len(), bitmap.container_count());
 
 if bitmap.contains(42) {
     // Position 42 is set.
@@ -88,6 +112,11 @@ The reader keeps the payload zero-copy and allocates descriptor and container
 offset indexes during parsing. `contains`, iteration, and `as_bytes` do not
 allocate.
 
+Both reader and builder expose Roaring-style `len() -> u64` and `is_empty()`.
+The existing `cardinality() -> u32` remains available for version-1 counts.
+Construction is fallible because Mumbling has a smaller, fixed universe;
+`parse` borrows bytes and serialization appends to a vector to support `no_std`.
+
 ## Construct and mutate
 
 `MumblingBitmapV1Builder` accepts individual positions, half-open ranges,
@@ -99,7 +128,7 @@ use mumbling::v1::MumblingBitmapV1Builder;
 
 # fn build() -> Result<(), Box<dyn std::error::Error>> {
 let mut bitmap = MumblingBitmapV1Builder::try_from_iter([7, 1, 7, 42])?;
-assert_eq!(bitmap.cardinality(), 3);
+assert_eq!(bitmap.len(), 3);
 
 assert!(bitmap.insert(100)?);
 assert!(bitmap.remove(7)?);
@@ -107,7 +136,7 @@ bitmap.insert_range(200..300)?;
 bitmap.remove_range(240..260)?;
 
 let sorted = MumblingBitmapV1Builder::from_sorted_iter([1, 10, 100])?;
-assert_eq!(sorted.cardinality(), 3);
+assert_eq!(sorted.len(), 3);
 # Ok(())
 # }
 ```
@@ -132,8 +161,8 @@ let right = MumblingBitmapV1Builder::try_from([3, 4, 5])?;
 let union = &left | &right;
 let intersection = &left & &right;
 
-assert_eq!(union.cardinality(), 5);
-assert_eq!(intersection.cardinality(), 1);
+assert_eq!(union.len(), 5);
+assert_eq!(intersection.len(), 1);
 assert_eq!(left.union_len(&right), 5);
 assert_eq!(left.intersection_len(&right), 1);
 assert_eq!(left.difference_len(&right), 2);
@@ -164,9 +193,11 @@ assert_eq!(output, encoded);
 # }
 ```
 
-For repeated writes of an unchanged bitmap, `prepare_serialization` owns a
-cached wire image while borrowing the builder. Its `as_bytes` is zero-copy;
-`serialize` and `serialize_into` copy the cached bytes.
+For repeated writes, `prepare_serialization` returns an owned snapshot. It can
+outlive the builder and is unaffected by subsequent mutations. Its `as_bytes`
+is zero-copy; `serialize` and `serialize_into` copy the cached bytes, and
+`into_bytes` transfers ownership without copying. Preparation itself does the
+same encoding work as one call to `serialize`.
 
 ```rust
 use mumbling::v1::MumblingBitmapV1Builder;
@@ -177,7 +208,10 @@ let bitmap = MumblingBitmapV1Builder::try_from([1, 2, 3])?;
 let prepared = bitmap.prepare_serialization();
 
 write(prepared.as_bytes());
+drop(bitmap); // The snapshot owns its bytes.
 write(prepared.as_bytes());
+let encoded = prepared.into_bytes();
+write(&encoded);
 # Ok(())
 # }
 ```

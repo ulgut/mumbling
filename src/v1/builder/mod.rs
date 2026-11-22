@@ -30,13 +30,12 @@ pub struct MumblingBitmapV1Builder {
     prefix_len: u32,
 }
 
-/// Cached version-1 wire image for an immutable builder.
+/// An owned snapshot of a version-1 wire image.
 ///
-/// Preparing a plan performs serialization once. The plan borrows its builder,
-/// preventing mutation while the cached bytes are used.
+/// Preparing a plan performs serialization once. Subsequent builder mutations
+/// do not affect the snapshot, which can also outlive the builder.
 #[derive(Debug)]
-pub struct MumblingBitmapV1SerializationPlan<'a> {
-    _bitmap: &'a MumblingBitmapV1Builder,
+pub struct MumblingBitmapV1SerializationPlan {
     encoded: Vec<u8>,
 }
 
@@ -96,13 +95,13 @@ impl MumblingBitmapV1Builder {
                     position,
                 }));
             }
-            if let Some(previous) = previous {
-                if position <= previous {
-                    return Err(FromSortedError::NotStrictlyIncreasing {
-                        previous,
-                        current: position,
-                    });
-                }
+            if let Some(previous) = previous
+                && position <= previous
+            {
+                return Err(FromSortedError::NotStrictlyIncreasing {
+                    previous,
+                    current: position,
+                });
             }
             let word_index = (position >> 6) as usize;
             if word_index >= bitmap.words.len() {
@@ -304,6 +303,12 @@ impl MumblingBitmapV1Builder {
         self.cardinality
     }
 
+    /// Returns the number of positions, using Roaring's `u64` count convention.
+    #[inline]
+    pub const fn len(&self) -> u64 {
+        self.cardinality as u64
+    }
+
     /// Returns whether the bitmap contains no positions.
     #[inline]
     pub const fn is_empty(&self) -> bool {
@@ -350,9 +355,11 @@ impl MumblingBitmapV1Builder {
     }
 
     /// Serializes once and caches the complete wire image for repeated use.
-    pub fn prepare_serialization(&self) -> MumblingBitmapV1SerializationPlan<'_> {
+    ///
+    /// The returned snapshot is independent of this builder. Preparation does
+    /// the same encoding work as [`Self::serialize`]; subsequent writes copy bytes.
+    pub fn prepare_serialization(&self) -> MumblingBitmapV1SerializationPlan {
         MumblingBitmapV1SerializationPlan {
-            _bitmap: self,
             encoded: self.serialize(),
         }
     }
@@ -391,6 +398,9 @@ impl MumblingBitmapV1Builder {
     }
 
     /// Returns the exact serialized length in bytes without allocating.
+    ///
+    /// This analyzes container descriptors and their compression; it is not a
+    /// constant-time query. [`Self::serialize`] does not require calling it first.
     pub fn serialized_size(&self) -> usize {
         let container_count = self.container_count();
         let mut size = HEADER_LEN;
@@ -597,7 +607,12 @@ fn intersection_len_indexed(
         .sum()
 }
 
-impl MumblingBitmapV1SerializationPlan<'_> {
+impl MumblingBitmapV1SerializationPlan {
+    /// Consumes the snapshot and transfers its wire bytes without copying.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.encoded
+    }
+
     /// Returns the exact serialized length in constant time.
     #[inline]
     pub fn serialized_size(&self) -> usize {

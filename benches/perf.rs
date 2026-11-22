@@ -1,26 +1,26 @@
-mod support;
+//! Operation-level latency/throughput, or an isolated allocation audit.
+mod helpers;
 
 use std::hint::black_box;
 use std::time::Duration;
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use mumbling::MAX_VALUES;
-use mumbling::v1::{MumblingBitmapV1, MumblingBitmapV1Builder};
-use roaring::RoaringBitmap;
+use ::mumbling::MAX_VALUES;
+use ::mumbling::v1::{MumblingBitmapV1, MumblingBitmapV1Builder};
+use ::roaring::RoaringBitmap;
+use criterion::{BenchmarkId, Throughput, criterion_group};
 
-use support::{
+use helpers::{
     LARGE_CONTAINER_COUNT, MEDIUM_CONTAINER_COUNT, QUERY_COUNT, lookup_queries, mumbling,
-    mumbling_sorted, random_positions, roaring, strided_lookup_queries, strided_positions,
-    uniform_positions,
+    random_positions, roaring, strided_lookup_queries, strided_positions, uniform_positions,
 };
 
-fn parse_boundaries(c: &mut Criterion) {
+fn parse_boundaries(c: &mut helpers::BenchCriterion) {
     let mut group = c.benchmark_group("parse/container-boundaries");
     for container_count in [255, 256, 257, LARGE_CONTAINER_COUNT] {
         for cardinality in [1, 31, 32, 33, 256] {
             let positions = uniform_positions(container_count, cardinality);
-            let encoded = mumbling_sorted(&positions).serialize();
-            let roaring = roaring(&positions);
+            let encoded = mumbling::from_sorted_positions(&positions).serialize();
+            let roaring = roaring::optimized(&positions);
             let mut roaring_encoded = Vec::with_capacity(roaring.serialized_size());
             roaring.serialize_into(&mut roaring_encoded).unwrap();
 
@@ -52,15 +52,15 @@ fn parse_boundaries(c: &mut Criterion) {
     group.finish();
 }
 
-fn contains(c: &mut Criterion) {
+fn contains(c: &mut helpers::BenchCriterion) {
     let mut group = c.benchmark_group("contains/semantic-comparison");
     group.throughput(Throughput::Elements(QUERY_COUNT as u64));
 
     for cardinality in [1, 31, 32, 33, 256] {
         let positions = uniform_positions(MEDIUM_CONTAINER_COUNT, cardinality);
-        let encoded = mumbling_sorted(&positions).serialize();
+        let encoded = mumbling::from_sorted_positions(&positions).serialize();
         let bitmap = MumblingBitmapV1::parse(&encoded).unwrap();
-        let roaring = roaring(&positions);
+        let roaring = roaring::optimized(&positions);
 
         for (kind, queries) in query_sets(cardinality) {
             group.bench_with_input(
@@ -77,9 +77,9 @@ fn contains(c: &mut Criterion) {
     }
 
     let positions = strided_positions(MEDIUM_CONTAINER_COUNT, 31, 8);
-    let encoded = mumbling_sorted(&positions).serialize();
+    let encoded = mumbling::from_sorted_positions(&positions).serialize();
     let bitmap = MumblingBitmapV1::parse(&encoded).unwrap();
-    let roaring = roaring(&positions);
+    let roaring = roaring::optimized(&positions);
     for (kind, queries) in [
         ("hit", strided_lookup_queries(31, 8, true)),
         ("miss-in-range", strided_lookup_queries(31, 8, false)),
@@ -98,13 +98,13 @@ fn contains(c: &mut Criterion) {
     group.finish();
 }
 
-fn iteration(c: &mut Criterion) {
+fn iteration(c: &mut helpers::BenchCriterion) {
     let mut group = c.benchmark_group("iterate/semantic-comparison");
     for cardinality in [1, 31, 32, 33, 256] {
         let positions = uniform_positions(MEDIUM_CONTAINER_COUNT, cardinality);
-        let encoded = mumbling_sorted(&positions).serialize();
+        let encoded = mumbling::from_sorted_positions(&positions).serialize();
         let bitmap = MumblingBitmapV1::parse(&encoded).unwrap();
-        let roaring = roaring(&positions);
+        let roaring = roaring::optimized(&positions);
         group.throughput(Throughput::Elements(positions.len() as u64));
 
         group.bench_function(BenchmarkId::new("mumbling", cardinality), |b| {
@@ -125,7 +125,7 @@ fn iteration(c: &mut Criterion) {
     group.finish();
 }
 
-fn construction(c: &mut Criterion) {
+fn construction(c: &mut helpers::BenchCriterion) {
     let random = random_positions(100_000);
     let mut sorted = random.clone();
     sorted.sort_unstable();
@@ -146,6 +146,9 @@ fn construction(c: &mut Criterion) {
                 .collect::<RoaringBitmap>()
         });
     });
+    group.bench_function("roaring/random-sort-bulk", |b| {
+        b.iter(|| helpers::roaring::from_unsorted_bulk(black_box(&random)));
+    });
 
     group.throughput(Throughput::Elements(sorted.len() as u64));
     group.bench_function("mumbling/sorted", |b| {
@@ -154,12 +157,7 @@ fn construction(c: &mut Criterion) {
         });
     });
     group.bench_function("roaring/sorted", |b| {
-        b.iter(|| {
-            black_box(&sorted)
-                .iter()
-                .copied()
-                .collect::<RoaringBitmap>()
-        });
+        b.iter(|| RoaringBitmap::from_sorted_iter(black_box(&sorted).iter().copied()).unwrap());
     });
 
     group.throughput(Throughput::Elements(MAX_VALUES as u64));
@@ -180,16 +178,19 @@ fn construction(c: &mut Criterion) {
     group.finish();
 }
 
-fn serialization(c: &mut Criterion) {
+fn serialization(c: &mut helpers::BenchCriterion) {
     let positions = random_positions(100_000);
-    let mumbling = mumbling(&positions);
-    let roaring = roaring(&positions);
+    let mumbling = mumbling::from_positions(&positions);
+    let roaring = roaring::optimized(&positions);
     let mumbling_size = mumbling.serialized_size();
     let prepared = mumbling.prepare_serialization();
     let roaring_size = roaring.serialized_size();
+    let mut roaring_prepared = Vec::with_capacity(roaring_size);
+    roaring.serialize_into(&mut roaring_prepared).unwrap();
     println!("100k random encoded size: mumbling={mumbling_size} B, roaring={roaring_size} B");
 
     let mut group = c.benchmark_group("serialize/format-specific");
+    group.throughput(Throughput::Elements(1));
     group.bench_function("mumbling/allocate", |b| {
         b.iter(|| black_box(&mumbling).serialize());
     });
@@ -245,10 +246,21 @@ fn serialization(c: &mut Criterion) {
     group.bench_function("roaring/size", |b| {
         b.iter(|| black_box(&roaring).serialized_size());
     });
+    group.bench_function("roaring/prepared-allocate", |b| {
+        b.iter(|| black_box(&roaring_prepared).clone());
+    });
+    group.bench_function("roaring/prepared-reuse", |b| {
+        b.iter(|| {
+            roaring_output.clear();
+            roaring_output.extend_from_slice(black_box(&roaring_prepared));
+            black_box(&roaring_output);
+        });
+    });
     group.finish();
 
     let mut group = c.benchmark_group("serialize/amortized-copies");
     for copies in [1, 2, 4, 8] {
+        group.throughput(Throughput::Elements(copies as u64));
         group.bench_function(BenchmarkId::new("mumbling", copies), |b| {
             b.iter(|| {
                 let prepared = black_box(&mumbling).prepare_serialization();
@@ -262,12 +274,12 @@ fn serialization(c: &mut Criterion) {
         });
         group.bench_function(BenchmarkId::new("roaring", copies), |b| {
             b.iter(|| {
+                let mut prepared = Vec::with_capacity(roaring_size);
+                black_box(&roaring).serialize_into(&mut prepared).unwrap();
                 let mut output = Vec::with_capacity(roaring_size);
                 for _ in 0..copies {
                     output.clear();
-                    black_box(&roaring)
-                        .serialize_into(black_box(&mut output))
-                        .unwrap();
+                    output.extend_from_slice(black_box(&prepared));
                     black_box(&output);
                 }
             });
@@ -276,13 +288,13 @@ fn serialization(c: &mut Criterion) {
     group.finish();
 }
 
-fn set_operations(c: &mut Criterion) {
+fn set_operations(c: &mut helpers::BenchCriterion) {
     let left_positions: Vec<_> = (0..MAX_VALUES).step_by(3).collect();
     let right_positions: Vec<_> = (0..MAX_VALUES).step_by(5).collect();
-    let mumbling_left = mumbling_sorted(&left_positions);
-    let mumbling_right = mumbling_sorted(&right_positions);
-    let roaring_left = roaring(&left_positions);
-    let roaring_right = roaring(&right_positions);
+    let mumbling_left = mumbling::from_sorted_positions(&left_positions);
+    let mumbling_right = mumbling::from_sorted_positions(&right_positions);
+    let roaring_left = roaring::optimized(&left_positions);
+    let roaring_right = roaring::optimized(&right_positions);
 
     let mut group = c.benchmark_group("set/semantic-comparison");
     group.throughput(Throughput::Elements(MAX_VALUES as u64));
@@ -337,6 +349,49 @@ fn set_operations(c: &mut Criterion) {
     group.finish();
 }
 
+/// Distinguishes descriptor compression, sparse extraction, and dense copying
+/// without exposing implementation internals in the public library API.
+fn serialization_layouts(c: &mut helpers::BenchCriterion) {
+    let mut group = c.benchmark_group("serialize/layout");
+    group.throughput(Throughput::Elements(1));
+    for (name, positions) in [
+        (
+            "uniform-sparse-12",
+            uniform_positions(LARGE_CONTAINER_COUNT, 12),
+        ),
+        (
+            "uniform-sparse-31",
+            uniform_positions(LARGE_CONTAINER_COUNT, 31),
+        ),
+        (
+            "uniform-dense-32",
+            uniform_positions(LARGE_CONTAINER_COUNT, 32),
+        ),
+        ("full-universe", (0..MAX_VALUES).collect()),
+    ] {
+        let bitmap = mumbling::from_sorted_positions(&positions);
+        let roaring = roaring::optimized(&positions);
+        let encoded = bitmap.serialize();
+        assert!(
+            MumblingBitmapV1::parse(&encoded)
+                .unwrap()
+                .iter()
+                .eq(roaring.iter())
+        );
+        group.bench_function(BenchmarkId::new("mumbling", name), |b| {
+            b.iter(|| black_box(&bitmap).serialize());
+        });
+        group.bench_function(BenchmarkId::new("roaring", name), |b| {
+            b.iter(|| {
+                let mut output = Vec::with_capacity(roaring.serialized_size());
+                black_box(&roaring).serialize_into(&mut output).unwrap();
+                output
+            });
+        });
+    }
+    group.finish();
+}
+
 fn query_sets(cardinality: usize) -> Vec<(&'static str, Vec<u32>)> {
     let mut sets = Vec::with_capacity(2);
     sets.push(("hit", lookup_queries(cardinality, true)));
@@ -362,11 +417,210 @@ fn lookup_roaring(bitmap: &RoaringBitmap, queries: &[u32]) -> u32 {
 
 criterion_group! {
     name = benches;
-    config = Criterion::default()
+    config = helpers::criterion()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3))
         .sample_size(30)
         .noise_threshold(0.02);
-    targets = parse_boundaries, contains, iteration, construction, serialization, set_operations
+    targets = parse_boundaries, contains, iteration, construction, serialization, serialization_layouts, set_operations
 }
-criterion_main!(benches);
+fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--profile") {
+        if cfg!(feature = "bench-memory") {
+            panic!("profile without the tracking allocator");
+        }
+        profile_serialization();
+        return;
+    }
+    if cfg!(feature = "bench-memory") {
+        #[cfg(feature = "bench-memory")]
+        memory::run();
+    } else {
+        benches();
+        helpers::criterion().configure_from_args().final_summary();
+    }
+}
+
+/// Fixed work for Instruments, samply, or perf: fixture preparation and a short
+/// warmup precede the named loop. No Criterion calibration/reporting runs here.
+fn profile_serialization() {
+    let args: Vec<_> = std::env::args().collect();
+    assert!(
+        args.len() == 4,
+        "usage: --profile mumbling|roaring ITERATIONS"
+    );
+    let iterations: u64 = args[3].parse().expect("positive iteration count");
+    assert!(iterations > 0);
+    let positions = helpers::random_positions(100_000);
+    match args[2].as_str() {
+        "mumbling" => {
+            let bitmap = helpers::mumbling::from_positions(&positions);
+            let mut output = Vec::with_capacity(bitmap.serialized_size());
+            let mut encode = || {
+                output.clear();
+                black_box(&bitmap).serialize_into(black_box(&mut output));
+                black_box(&output);
+            };
+            for _ in 0..100 {
+                encode();
+            }
+            profile_loop(iterations, &mut encode);
+        }
+        "roaring" => {
+            let bitmap = helpers::roaring::optimized(&positions);
+            let mut output = Vec::with_capacity(bitmap.serialized_size());
+            let mut encode = || {
+                output.clear();
+                black_box(&bitmap)
+                    .serialize_into(black_box(&mut output))
+                    .unwrap();
+                black_box(&output);
+            };
+            for _ in 0..100 {
+                encode();
+            }
+            profile_loop(iterations, &mut encode);
+        }
+        _ => panic!("implementation must be mumbling or roaring"),
+    }
+}
+
+#[inline(never)]
+fn profile_loop(iterations: u64, encode: &mut impl FnMut()) {
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        encode();
+    }
+    eprintln!("{iterations} serializations in {:?}", start.elapsed());
+}
+
+#[cfg(feature = "bench-memory")]
+mod memory {
+    //! Allocation audit used only by `perf --features bench-memory`.
+
+    use std::hint::black_box;
+
+    use ::mumbling::v1::{MumblingBitmapV1, MumblingBitmapV1Builder};
+    use ::roaring::RoaringBitmap;
+
+    use crate::helpers::{mumbling, random_positions, roaring};
+
+    #[global_allocator]
+    static ALLOC: dhat::Alloc = dhat::Alloc;
+
+    const REPETITIONS: u64 = 100;
+
+    pub(super) fn run() {
+        let positions = random_positions(100_000);
+        let builder = mumbling::from_positions(&positions);
+        let encoded = builder.serialize();
+        let roaring = roaring::optimized(&positions);
+        let mut roaring_encoded = Vec::with_capacity(roaring.serialized_size());
+        roaring.serialize_into(&mut roaring_encoded).unwrap();
+        let prepared = builder.prepare_serialization();
+        let mut output = Vec::with_capacity(builder.serialized_size());
+        builder.serialize_into(&mut output);
+        output.clear();
+        let _profiler = dhat::Profiler::builder().testing().build();
+
+        println!(
+            "wire bytes: mumbling={}, roaring={}",
+            encoded.len(),
+            roaring_encoded.len()
+        );
+        println!(
+            "output Vec capacity: mumbling={}, roaring={}",
+            encoded.capacity(),
+            roaring_encoded.capacity()
+        );
+        println!("allocation traffic per operation over {REPETITIONS} repetitions");
+        measure("parse/mumbling", || {
+            black_box(MumblingBitmapV1::parse(black_box(&encoded)).unwrap());
+        });
+        measure("parse/roaring", || {
+            black_box(RoaringBitmap::deserialize_from(black_box(&roaring_encoded[..])).unwrap());
+        });
+        measure("construct/mumbling", || {
+            black_box(
+                MumblingBitmapV1Builder::try_from_iter(black_box(&positions).iter().copied())
+                    .unwrap(),
+            );
+        });
+        measure("construct/roaring", || {
+            black_box(
+                black_box(&positions)
+                    .iter()
+                    .copied()
+                    .collect::<RoaringBitmap>(),
+            );
+        });
+        measure("construct/roaring-bulk", || {
+            black_box(roaring::from_unsorted_bulk(black_box(&positions)));
+        });
+        measure("serialize/mumbling", || {
+            black_box(black_box(&builder).serialize());
+        });
+        measure("serialize/roaring", || {
+            let mut output = Vec::with_capacity(roaring.serialized_size());
+            black_box(&roaring).serialize_into(&mut output).unwrap();
+            black_box(output);
+        });
+        measure("serialize/reuse", || {
+            output.clear();
+            black_box(&builder).serialize_into(black_box(&mut output));
+            black_box(&output);
+        });
+        measure("serialize/prepared", || {
+            output.clear();
+            prepared.serialize_into(black_box(&mut output));
+            black_box(&output);
+        });
+
+        println!("retained heap for one live bitmap");
+        measure_retained("reader/mumbling", || {
+            MumblingBitmapV1::parse(black_box(&encoded)).unwrap()
+        });
+        measure_retained("reader/roaring", || {
+            RoaringBitmap::deserialize_from(black_box(&roaring_encoded[..])).unwrap()
+        });
+        measure_retained("builder/mumbling", || {
+            MumblingBitmapV1Builder::try_from_iter(black_box(&positions).iter().copied()).unwrap()
+        });
+        measure_retained("builder/roaring", || {
+            black_box(&positions)
+                .iter()
+                .copied()
+                .collect::<RoaringBitmap>()
+        });
+        measure_retained("builder/roaring-bulk", || {
+            roaring::from_unsorted_bulk(black_box(&positions))
+        });
+    }
+
+    fn measure_retained<T>(name: &str, operation: impl FnOnce() -> T) {
+        let before = dhat::HeapStats::get();
+        let value = operation();
+        let after = dhat::HeapStats::get();
+        println!(
+            "{name:<24} {:>8} allocations  {:>12} bytes",
+            after.curr_blocks - before.curr_blocks,
+            after.curr_bytes - before.curr_bytes,
+        );
+        black_box(&value);
+    }
+
+    fn measure(name: &str, mut operation: impl FnMut()) {
+        let before = dhat::HeapStats::get();
+        for _ in 0..REPETITIONS {
+            operation();
+        }
+        let after = dhat::HeapStats::get();
+        let blocks = after.total_blocks - before.total_blocks;
+        let bytes = after.total_bytes - before.total_bytes;
+        println!(
+            "{name:<24} {:>8.2} allocations/op  {:>12.2} bytes/op",
+            blocks as f64 / REPETITIONS as f64,
+            bytes as f64 / REPETITIONS as f64
+        );
+    }
+}

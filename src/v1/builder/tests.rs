@@ -186,6 +186,26 @@ fn round_trips_container_and_descriptor_boundaries() {
 }
 
 #[test]
+fn prepared_snapshot_outlives_builder_and_transfers_its_allocation() {
+    let prepared = {
+        let mut bitmap = MumblingBitmapV1Builder::try_from([1, 255, MAX_POSITION]).unwrap();
+        let prepared = bitmap.prepare_serialization();
+        bitmap.clear();
+        bitmap.insert(42).unwrap();
+        prepared
+    };
+    let pointer = prepared.as_bytes().as_ptr();
+    let bytes = prepared.into_bytes();
+    assert_eq!(bytes.as_ptr(), pointer);
+    assert!(
+        MumblingBitmapV1::parse(&bytes)
+            .unwrap()
+            .iter()
+            .eq([1, 255, MAX_POSITION])
+    );
+}
+
+#[test]
 fn switches_wire_container_at_32_positions() {
     let mut bitmap = MumblingBitmapV1Builder::from_sorted_iter(0..31).unwrap();
     let sparse = bitmap.serialize();
